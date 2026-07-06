@@ -1,0 +1,15 @@
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# Camera/Steer/Throttle/Path_Planning/Explore_Map 끼리 주고받는 실행 중 상태 파일
+# (다른 기기/실행마다 새로 생기는 런타임 산출물이라 커밋 대상 아님)
+state/
+
+# build_map.py / explore_and_map.py 가 만드는 맵 산출물 (센서 데이터 기반 생성물)
+map_output/
+planned_path.csv
+planned_path.png
+
+# 라이다 원본 로그 (용량 크고 실행할 때마다 새로 생김)
+lidar_log_*.csv
