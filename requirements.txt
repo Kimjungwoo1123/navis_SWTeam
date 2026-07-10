@@ -1,17 +1,17 @@
 # Testing/ 전체에서 쓰는 pip 설치 대상 패키지 목록.
 # 설치: pip3 install -r requirements.txt
-# (또는 install_requirements.sh 를 실행하면 아래 + RPi.GPIO/picamera2 까지 한 번에 처리됨)
+# (또는 install_requirements.sh 를 실행하면 아래 + picamera2(apt)까지 한 번에 처리됨)
 numpy
 pandas
 matplotlib
 scipy
 opencv-python
 pyserial
+python-can
 
-# ---- 아래 두 개는 여기 포함하지 않음 ----
-# RPi.GPIO, picamera2 는 하드웨어(GPIO 문자 디바이스, libcamera)에 바로 붙는 패키지라
-# 순수 pip보다 라즈베리파이 OS의 apt 패키지로 설치하는 게 훨씬 안정적입니다.
-# (picamera2는 공식적으로도 pip 대신 apt 설치를 권장합니다 - Raspberry Pi OS Bookworm
-# 이후 버전엔 기본으로 이미 깔려있는 경우도 많습니다.)
-# install_requirements.sh 가 다음으로 설치합니다:
-#   sudo apt install -y python3-rpi.gpio python3-picamera2
+# ---- picamera2 는 여기 포함하지 않음 ----
+# 카메라 하드웨어(libcamera)에 바로 붙는 패키지라 순수 pip보다 apt 패키지로 설치하는 게
+# 훨씬 안정적입니다. install_requirements.sh 가 apt로 설치합니다.
+#
+# RPi.GPIO는 이제 이 레포 어디서도 쓰지 않아서 목록에서 뺐습니다 (구동 모터는 STM32에
+# CAN(python-can)으로 명령만 보내고, 라이다는 USB 어댑터가 회전 모터 구동까지 자체 처리).

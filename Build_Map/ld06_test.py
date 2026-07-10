@@ -4,17 +4,11 @@ import time
 import struct
 
 import serial
-import RPi.GPIO as GPIO
 
-# PWM 설정 (CTRL 핀 - GPIO12)
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(12, GPIO.OUT)
-pwm = GPIO.PWM(12, 50000)  # 50kHz PWM
-pwm.start(50)  # 듀티사이클 50%
-
-# 시리얼 포트 설정
+# 라이다가 USB 어댑터로 연결됨 - 어댑터가 회전 모터 구동을 자체 처리하므로
+# GPIO PWM 제어는 더 이상 필요 없음. 시리얼 데이터만 USB로 받음.
 ser = serial.Serial(
-    port='/dev/ttyS0',  # 안되면 /dev/ttyAMA0 으로 바꿔봐
+    port='/dev/ttyUSB0',  # 다른 USB 시리얼 장치가 꽂혀있으면 순서가 바뀔 수 있음 (ls /dev/ttyUSB* 로 확인)
     baudrate=230400,
     timeout=1
 )
@@ -88,6 +82,4 @@ try:
 
 except KeyboardInterrupt:
     print(f"\n종료 - 저장됨: {os.path.abspath(OUT_CSV)}")
-    pwm.stop()
-    GPIO.cleanup()
     ser.close()
