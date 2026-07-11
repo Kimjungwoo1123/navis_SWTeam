@@ -50,6 +50,7 @@ Testing/state/ 의 speed_command.json, lidar_steering.json 을 읽는 방식 그
 """
 
 import os
+import csv
 import json
 import time
 import argparse
@@ -799,166 +800,243 @@ class LiveMapView:
 
 
 # ----------------------------
+# 명령 기록 - 매 사이클 실제로 내려간 조향/속도 명령을 CSV로 남긴다.
+# 차가 직진 명령인데도 한쪽으로 쏠린다면, 이 로그에서 steering_deg가 계속 한쪽 부호로만
+# 찍히는지(=소프트웨어가 애초에 삐딱한 조향을 명령함) 아니면 steering_deg는 0 근방인데도
+# 실제로는 쏠린다는 별도 관찰(=조향각 자체는 정상인데 구동축/얼라인먼트 등 기구적 문제)인지를
+# 나중에 CSV만 열어봐도 바로 구분할 수 있게 하기 위함.
+# ----------------------------
+class CommandLog:
+    def __init__(self, out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+        self.path = os.path.join(out_dir, "command_log.csv")
+        self._f = open(self.path, "w", newline="")
+        self._writer = csv.writer(self._f)
+        self._writer.writerow(["timestamp", "phase", "cycle", "x_mm", "y_mm", "theta_deg",
+                                "localize_mode", "localize_err_mm", "steering_deg",
+                                "speed_percent", "min_obstacle_dist_mm", "note"])
+        self._f.flush()
+
+    def log(self, phase, cycle, x, y, theta, mode, err, steering_deg, speed_percent,
+            min_obstacle_dist_mm, note=""):
+        self._writer.writerow([time.time(), phase, cycle, x, y, theta, mode, err,
+                                steering_deg, speed_percent, min_obstacle_dist_mm, note])
+        self._f.flush()  # Ctrl+C 등으로 중간에 죽어도 그때까지 기록은 남도록 매번 flush
+
+    def close(self):
+        self._f.close()
+
+
+class _NullCommandLog:
+    """CommandLog를 안 넘겼을 때(테스트 등) 조용히 아무것도 안 하는 대역."""
+
+    def log(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        pass
+
+
+NULL_COMMAND_LOG = _NullCommandLog()
+
+
+# ----------------------------
 # 탐색 루프
 # ----------------------------
-def run_exploration(read_scan_fn, max_cycles=MAX_EXPLORE_CYCLES, live_view=None):
+def run_exploration(read_scan_fn, max_cycles=MAX_EXPLORE_CYCLES, live_view=None, cmd_log=NULL_COMMAND_LOG):
     """
     read_scan_fn(): 다음 스캔의 [(angle_deg, distance_mm), ...] 를 반환하는 함수.
     실제 하드웨어에서는 read_one_rotation(ser)를 감싼 함수, 테스트에서는 가상 스캔 생성 함수를 넣음.
-    반환: (map_points, grid, origin, resolution, final_pose)
+    반환: (map_points, grid, origin, resolution, final_pose, interrupted)
+    interrupted=True면 Ctrl+C로 도중에 중단된 것 - 그때까지 쌓은 데이터는 정상적으로 반환하므로
+    호출부(main())는 이 경우에도 export_map()으로 저장할 수 있다.
     """
     grid, origin, resolution = init_explore_grid()
     map_points = np.empty((0, 2))
     pose = (0.0, 0.0, 0.0)
     min_obstacle_dist_mm = float("inf")
     consecutive_lost = 0
+    interrupted = False
 
-    for cycle in range(max_cycles):
-        scan_points = read_scan_fn()
-        current_scan = scan_points_to_xy(scan_points)
-        if len(current_scan) < 10:
-            print("  스캔 포인트가 너무 적습니다. 다음 회전을 기다립니다.")
-            continue
+    try:
+        for cycle in range(max_cycles):
+            scan_points = read_scan_fn()
+            current_scan = scan_points_to_xy(scan_points)
+            if len(current_scan) < 10:
+                print("  스캔 포인트가 너무 적습니다. 다음 회전을 기다립니다.")
+                continue
 
-        # --- 빠른 반사: 위치추정(ICP) 전에 raw 스캔만으로 즉시 장애물 체크 ---
-        # 위치추정+grid갱신+프론티어탐색까지 포함한 전체 사이클을 기다리면 그 사이 갑자기 나타난
-        # 장애물에 너무 늦게 반응하게 됨. 여기서 먼저 정지시켜두면 이번 스캔 주기(수백ms) 안에 반응함.
-        fast_min_obstacle_dist_mm = compute_min_obstacle_dist_mm(current_scan)
-        if fast_min_obstacle_dist_mm < EMERGENCY_STOP_DIST_MM:
-            publish_speed_command(0.0, fast_min_obstacle_dist_mm, goal_reached=False)
-            print(f"  [빠른 반사 정지] 장애물이 {fast_min_obstacle_dist_mm:.0f}mm 이내 감지 - "
-                  f"위치추정/프론티어탐색 전에 즉시 정지 명령을 보냈습니다.")
+            # --- 빠른 반사: 위치추정(ICP) 전에 raw 스캔만으로 즉시 장애물 체크 ---
+            # 위치추정+grid갱신+프론티어탐색까지 포함한 전체 사이클을 기다리면 그 사이 갑자기 나타난
+            # 장애물에 너무 늦게 반응하게 됨. 여기서 먼저 정지시켜두면 이번 스캔 주기(수백ms) 안에 반응함.
+            fast_min_obstacle_dist_mm = compute_min_obstacle_dist_mm(current_scan)
+            if fast_min_obstacle_dist_mm < EMERGENCY_STOP_DIST_MM:
+                publish_speed_command(0.0, fast_min_obstacle_dist_mm, goal_reached=False)
+                print(f"  [빠른 반사 정지] 장애물이 {fast_min_obstacle_dist_mm:.0f}mm 이내 감지 - "
+                      f"위치추정/프론티어탐색 전에 즉시 정지 명령을 보냈습니다.")
+                cmd_log.log("explore", cycle, *pose, "n/a", None, None, 0.0,
+                             fast_min_obstacle_dist_mm, note="fast_stop")
 
-        if cycle == 0:
-            x, y, theta, err, mode = 0.0, 0.0, 0.0, 0.0, "origin"
-        else:
-            map_icp_target = downsample_points(map_points, MAP_ICP_DOWNSAMPLE)
-            x, y, theta, err, mode, consecutive_lost, trustworthy = localize_with_recovery(
-                current_scan, map_icp_target, pose, consecutive_lost)
-            if not trustworthy:
-                print(f"  [위치추정 실패] 오차 {err:.0f}mm - 전역 탐색까지 해봐도 위치를 신뢰할 수 "
-                      f"없습니다. 이번 사이클은 정지하고, 맵/위치는 갱신하지 않습니다.")
-                publish_speed_command(0.0, compute_min_obstacle_dist_mm(current_scan), goal_reached=False)
-                continue  # pose/map/grid 그대로 - 다음 사이클도 직전 신뢰 위치 근방부터 다시 시도
-
-        pose = (x, y, theta)
-        print(f"[cycle {cycle}] 위치({mode}): x={x:.0f}mm y={y:.0f}mm theta={theta:.1f}deg err={err:.1f}mm")
-
-        scan_world = transform_points(current_scan, x, y, theta)
-        map_points = np.vstack([map_points, scan_world]) if len(map_points) else scan_world
-        raytrace_update(grid, origin, resolution, (x, y), scan_world)
-
-        min_obstacle_dist_mm = compute_min_obstacle_dist_mm(current_scan)
-        base_speed_percent = 0.0 if min_obstacle_dist_mm < EMERGENCY_STOP_DIST_MM else CRUISE_SPEED_PERCENT_EXPLORE
-
-        if is_boxed_in(grid, origin, resolution, x, y, theta):
-            publish_speed_command(0.0, min_obstacle_dist_mm, goal_reached=False)
-            if live_view is not None:
-                live_view.update(grid, origin, resolution, pose, goal_xy=None,
-                                  title=f"탐색 cycle {cycle} - 전/후/좌/우 모두 막힘, 종료")
-            print("  전/후/좌/우 모두 확인된 장애물로 막혀 더 이상 움직일 수 없습니다 - 탐색을 종료합니다.")
-            break
-
-        inflated = build_planning_grid(grid, INFLATE_CELLS)
-        goal_xy, reason = choose_frontier_goal(grid, (x, y), origin, resolution, inflated)
-
-        if live_view is not None:
-            live_view.update(grid, origin, resolution, pose, goal_xy=goal_xy, title=f"탐색 중 - cycle {cycle}")
-
-        if goal_xy is None:
-            publish_speed_command(0.0, min_obstacle_dist_mm, goal_reached=False)
-            if reason == "no_frontier":
-                print("탐색 완료 - 더 갈 미지 영역이 없습니다.")
+            if cycle == 0:
+                x, y, theta, err, mode = 0.0, 0.0, 0.0, 0.0, "origin"
             else:
-                print("남은 미지 영역은 있지만 전부 경로가 막혀있어 탐색을 종료합니다.")
-            break
+                map_icp_target = downsample_points(map_points, MAP_ICP_DOWNSAMPLE)
+                x, y, theta, err, mode, consecutive_lost, trustworthy = localize_with_recovery(
+                    current_scan, map_icp_target, pose, consecutive_lost)
+                if not trustworthy:
+                    print(f"  [위치추정 실패] 오차 {err:.0f}mm - 전역 탐색까지 해봐도 위치를 신뢰할 수 "
+                          f"없습니다. 이번 사이클은 정지하고, 맵/위치는 갱신하지 않습니다.")
+                    publish_speed_command(0.0, compute_min_obstacle_dist_mm(current_scan), goal_reached=False)
+                    cmd_log.log("explore", cycle, *pose, mode, err, None, 0.0,
+                                 compute_min_obstacle_dist_mm(current_scan), note="localization_lost")
+                    continue  # pose/map/grid 그대로 - 다음 사이클도 직전 신뢰 위치 근방부터 다시 시도
 
-        start_rc = world_to_grid(x, y, origin, resolution)
-        goal_rc = world_to_grid(goal_xy[0], goal_xy[1], origin, resolution)
-        path_rc = astar(inflated, start_rc, goal_rc)
-        if path_rc is None:
-            publish_speed_command(apply_min_moving_floor(base_speed_percent), min_obstacle_dist_mm, goal_reached=False)
-            print("  이 프론티어로 가는 경로를 못 찾았습니다. 다음 사이클에 재시도합니다.")
-            continue
+            pose = (x, y, theta)
+            print(f"[cycle {cycle}] 위치({mode}): x={x:.0f}mm y={y:.0f}mm theta={theta:.1f}deg err={err:.1f}mm")
 
-        path_world = [grid_to_world(r, c, origin, resolution) for r, c in path_rc]
-        steering_deg = pure_pursuit_steering(path_world, x, y, theta, max_steering_deg=EXPLORE_MAX_STEERING_DEG)
-        publish_lidar_steering(steering_deg)
+            scan_world = transform_points(current_scan, x, y, theta)
+            map_points = np.vstack([map_points, scan_world]) if len(map_points) else scan_world
+            raytrace_update(grid, origin, resolution, (x, y), scan_world)
 
-        # 회전이 급할수록(조향각이 클수록) 순항 속도를 낮춤 - 비상정지(base_speed_percent=0)는 항상 우선됨.
-        # 다만 곡률감속이나 낮은 순항속도 자체가 데드존(MIN_MOVING_SPEED_PERCENT) 밑으로 내려가면 안 되므로
-        # apply_min_moving_floor로 바닥을 깐다 (정지 의도인 0.0은 그대로 통과시킴).
-        speed_percent = apply_min_moving_floor(base_speed_percent * curvature_speed_factor(steering_deg))
-        publish_speed_command(speed_percent, min_obstacle_dist_mm, goal_reached=False)
-    else:
-        print(f"[안내] 최대 사이클({max_cycles}) 도달 - 탐색을 중단합니다.")
+            min_obstacle_dist_mm = compute_min_obstacle_dist_mm(current_scan)
+            base_speed_percent = 0.0 if min_obstacle_dist_mm < EMERGENCY_STOP_DIST_MM else CRUISE_SPEED_PERCENT_EXPLORE
+
+            if is_boxed_in(grid, origin, resolution, x, y, theta):
+                publish_speed_command(0.0, min_obstacle_dist_mm, goal_reached=False)
+                cmd_log.log("explore", cycle, x, y, theta, mode, err, None, 0.0,
+                             min_obstacle_dist_mm, note="boxed_in")
+                if live_view is not None:
+                    live_view.update(grid, origin, resolution, pose, goal_xy=None,
+                                      title=f"탐색 cycle {cycle} - 전/후/좌/우 모두 막힘, 종료")
+                print("  전/후/좌/우 모두 확인된 장애물로 막혀 더 이상 움직일 수 없습니다 - 탐색을 종료합니다.")
+                break
+
+            inflated = build_planning_grid(grid, INFLATE_CELLS)
+            goal_xy, reason = choose_frontier_goal(grid, (x, y), origin, resolution, inflated)
+
+            if live_view is not None:
+                live_view.update(grid, origin, resolution, pose, goal_xy=goal_xy, title=f"탐색 중 - cycle {cycle}")
+
+            if goal_xy is None:
+                publish_speed_command(0.0, min_obstacle_dist_mm, goal_reached=False)
+                cmd_log.log("explore", cycle, x, y, theta, mode, err, None, 0.0,
+                             min_obstacle_dist_mm, note=f"stop_{reason}")
+                if reason == "no_frontier":
+                    print("탐색 완료 - 더 갈 미지 영역이 없습니다.")
+                else:
+                    print("남은 미지 영역은 있지만 전부 경로가 막혀있어 탐색을 종료합니다.")
+                break
+
+            start_rc = world_to_grid(x, y, origin, resolution)
+            goal_rc = world_to_grid(goal_xy[0], goal_xy[1], origin, resolution)
+            path_rc = astar(inflated, start_rc, goal_rc)
+            if path_rc is None:
+                floored = apply_min_moving_floor(base_speed_percent)
+                publish_speed_command(floored, min_obstacle_dist_mm, goal_reached=False)
+                cmd_log.log("explore", cycle, x, y, theta, mode, err, None, floored,
+                             min_obstacle_dist_mm, note="no_path")
+                print("  이 프론티어로 가는 경로를 못 찾았습니다. 다음 사이클에 재시도합니다.")
+                continue
+
+            path_world = [grid_to_world(r, c, origin, resolution) for r, c in path_rc]
+            steering_deg = pure_pursuit_steering(path_world, x, y, theta, max_steering_deg=EXPLORE_MAX_STEERING_DEG)
+            publish_lidar_steering(steering_deg)
+
+            # 회전이 급할수록(조향각이 클수록) 순항 속도를 낮춤 - 비상정지(base_speed_percent=0)는 항상 우선됨.
+            # 다만 곡률감속이나 낮은 순항속도 자체가 데드존(MIN_MOVING_SPEED_PERCENT) 밑으로 내려가면 안 되므로
+            # apply_min_moving_floor로 바닥을 깐다 (정지 의도인 0.0은 그대로 통과시킴).
+            speed_percent = apply_min_moving_floor(base_speed_percent * curvature_speed_factor(steering_deg))
+            publish_speed_command(speed_percent, min_obstacle_dist_mm, goal_reached=False)
+            cmd_log.log("explore", cycle, x, y, theta, mode, err, steering_deg, speed_percent,
+                         min_obstacle_dist_mm)
+        else:
+            print(f"[안내] 최대 사이클({max_cycles}) 도달 - 탐색을 중단합니다.")
+    except KeyboardInterrupt:
+        interrupted = True
+        print("  [중단] Ctrl+C로 탐색을 중단했습니다 - 지금까지 만든 맵을 저장합니다.")
 
     publish_speed_command(0.0, min_obstacle_dist_mm, goal_reached=False)
-    return map_points, grid, origin, resolution, pose
+    return map_points, grid, origin, resolution, pose, interrupted
 
 
 def return_to_origin(read_scan_fn, map_points, grid, origin, resolution, pose, max_cycles=MAX_EXPLORE_CYCLES,
-                      live_view=None):
+                      live_view=None, cmd_log=NULL_COMMAND_LOG):
     """완성된 지도를 이용해 A*+Pure Pursuit로 원점(0,0)까지 복귀"""
     inflated = build_planning_grid(grid, INFLATE_CELLS)
     map_icp_target = downsample_points(map_points, MAP_ICP_DOWNSAMPLE)
     consecutive_lost = 0
 
-    for _ in range(max_cycles):
-        scan_points = read_scan_fn()
-        current_scan = scan_points_to_xy(scan_points)
-        if len(current_scan) < 10:
-            continue
+    try:
+        for cycle in range(max_cycles):
+            scan_points = read_scan_fn()
+            current_scan = scan_points_to_xy(scan_points)
+            if len(current_scan) < 10:
+                continue
 
-        # --- 빠른 반사: 위치추정(ICP) 전에 raw 스캔만으로 즉시 장애물 체크 (복귀 중에도 동일하게 적용) ---
-        fast_min_obstacle_dist_mm = compute_min_obstacle_dist_mm(current_scan)
-        if fast_min_obstacle_dist_mm < EMERGENCY_STOP_DIST_MM:
-            publish_speed_command(0.0, fast_min_obstacle_dist_mm, goal_reached=False)
-            print(f"  [빠른 반사 정지] 장애물이 {fast_min_obstacle_dist_mm:.0f}mm 이내 감지 - "
-                  f"위치추정 전에 즉시 정지 명령을 보냈습니다.")
+            # --- 빠른 반사: 위치추정(ICP) 전에 raw 스캔만으로 즉시 장애물 체크 (복귀 중에도 동일하게 적용) ---
+            fast_min_obstacle_dist_mm = compute_min_obstacle_dist_mm(current_scan)
+            if fast_min_obstacle_dist_mm < EMERGENCY_STOP_DIST_MM:
+                publish_speed_command(0.0, fast_min_obstacle_dist_mm, goal_reached=False)
+                print(f"  [빠른 반사 정지] 장애물이 {fast_min_obstacle_dist_mm:.0f}mm 이내 감지 - "
+                      f"위치추정 전에 즉시 정지 명령을 보냈습니다.")
+                cmd_log.log("return", cycle, *pose, "n/a", None, None, 0.0,
+                             fast_min_obstacle_dist_mm, note="fast_stop")
 
-        x, y, theta, err, mode, consecutive_lost, trustworthy = localize_with_recovery(
-            current_scan, map_icp_target, pose, consecutive_lost)
-        if not trustworthy:
-            print(f"  [위치추정 실패] 오차 {err:.0f}mm - 전역 탐색까지 해봐도 위치를 신뢰할 수 "
-                  f"없습니다. 이번 사이클은 정지하고, 위치는 갱신하지 않습니다.")
-            publish_speed_command(0.0, compute_min_obstacle_dist_mm(current_scan), goal_reached=False)
-            continue  # pose 그대로 - 다음 사이클도 직전 신뢰 위치 근방부터 다시 시도
+            x, y, theta, err, mode, consecutive_lost, trustworthy = localize_with_recovery(
+                current_scan, map_icp_target, pose, consecutive_lost)
+            if not trustworthy:
+                print(f"  [위치추정 실패] 오차 {err:.0f}mm - 전역 탐색까지 해봐도 위치를 신뢰할 수 "
+                      f"없습니다. 이번 사이클은 정지하고, 위치는 갱신하지 않습니다.")
+                publish_speed_command(0.0, compute_min_obstacle_dist_mm(current_scan), goal_reached=False)
+                cmd_log.log("return", cycle, *pose, mode, err, None, 0.0,
+                             compute_min_obstacle_dist_mm(current_scan), note="localization_lost")
+                continue  # pose 그대로 - 다음 사이클도 직전 신뢰 위치 근방부터 다시 시도
 
-        pose = (x, y, theta)
-        print(f"[복귀] 위치({mode}): x={x:.0f}mm y={y:.0f}mm theta={theta:.1f}deg")
+            pose = (x, y, theta)
+            print(f"[복귀] 위치({mode}): x={x:.0f}mm y={y:.0f}mm theta={theta:.1f}deg")
 
-        if live_view is not None:
-            live_view.update(grid, origin, resolution, pose, goal_xy=(0.0, 0.0), title="원점으로 복귀 중")
+            if live_view is not None:
+                live_view.update(grid, origin, resolution, pose, goal_xy=(0.0, 0.0), title="원점으로 복귀 중")
 
-        dist_to_home = np.hypot(x, y)
-        if dist_to_home <= RETURN_HOME_TOLERANCE_MM:
-            publish_speed_command(0.0, float("inf"), goal_reached=True)
-            print(f"원점 복귀 완료 (남은 거리 {dist_to_home:.0f}mm).")
-            return True
+            dist_to_home = np.hypot(x, y)
+            if dist_to_home <= RETURN_HOME_TOLERANCE_MM:
+                publish_speed_command(0.0, float("inf"), goal_reached=True)
+                cmd_log.log("return", cycle, x, y, theta, mode, err, None, 0.0, float("inf"), note="arrived")
+                print(f"원점 복귀 완료 (남은 거리 {dist_to_home:.0f}mm).")
+                return True
 
-        min_obstacle_dist_mm = compute_min_obstacle_dist_mm(current_scan)
-        base_speed_percent = 0.0 if min_obstacle_dist_mm < EMERGENCY_STOP_DIST_MM else CRUISE_SPEED_PERCENT_EXPLORE
+            min_obstacle_dist_mm = compute_min_obstacle_dist_mm(current_scan)
+            base_speed_percent = 0.0 if min_obstacle_dist_mm < EMERGENCY_STOP_DIST_MM else CRUISE_SPEED_PERCENT_EXPLORE
 
-        if is_boxed_in(grid, origin, resolution, x, y, theta):
-            publish_speed_command(0.0, min_obstacle_dist_mm, goal_reached=False)
-            print("  전/후/좌/우 모두 확인된 장애물로 막혀 더 이상 움직일 수 없습니다 - 복귀를 중단합니다.")
-            return False
+            if is_boxed_in(grid, origin, resolution, x, y, theta):
+                publish_speed_command(0.0, min_obstacle_dist_mm, goal_reached=False)
+                cmd_log.log("return", cycle, x, y, theta, mode, err, None, 0.0,
+                             min_obstacle_dist_mm, note="boxed_in")
+                print("  전/후/좌/우 모두 확인된 장애물로 막혀 더 이상 움직일 수 없습니다 - 복귀를 중단합니다.")
+                return False
 
-        start_rc = world_to_grid(x, y, origin, resolution)
-        goal_rc = world_to_grid(0.0, 0.0, origin, resolution)
-        path_rc = astar(inflated, start_rc, goal_rc)
-        if path_rc is None:
-            publish_speed_command(apply_min_moving_floor(base_speed_percent), min_obstacle_dist_mm, goal_reached=False)
-            print("  복귀 경로를 못 찾았습니다. 다음 스캔에서 재시도합니다.")
-            continue
+            start_rc = world_to_grid(x, y, origin, resolution)
+            goal_rc = world_to_grid(0.0, 0.0, origin, resolution)
+            path_rc = astar(inflated, start_rc, goal_rc)
+            if path_rc is None:
+                floored = apply_min_moving_floor(base_speed_percent)
+                publish_speed_command(floored, min_obstacle_dist_mm, goal_reached=False)
+                cmd_log.log("return", cycle, x, y, theta, mode, err, None, floored,
+                             min_obstacle_dist_mm, note="no_path")
+                print("  복귀 경로를 못 찾았습니다. 다음 스캔에서 재시도합니다.")
+                continue
 
-        path_world = [grid_to_world(r, c, origin, resolution) for r, c in path_rc]
-        steering_deg = pure_pursuit_steering(path_world, x, y, theta, max_steering_deg=EXPLORE_MAX_STEERING_DEG)
-        publish_lidar_steering(steering_deg)
+            path_world = [grid_to_world(r, c, origin, resolution) for r, c in path_rc]
+            steering_deg = pure_pursuit_steering(path_world, x, y, theta, max_steering_deg=EXPLORE_MAX_STEERING_DEG)
+            publish_lidar_steering(steering_deg)
 
-        speed_percent = apply_min_moving_floor(base_speed_percent * curvature_speed_factor(steering_deg))
-        publish_speed_command(speed_percent, min_obstacle_dist_mm, goal_reached=False)
+            speed_percent = apply_min_moving_floor(base_speed_percent * curvature_speed_factor(steering_deg))
+            publish_speed_command(speed_percent, min_obstacle_dist_mm, goal_reached=False)
+            cmd_log.log("return", cycle, x, y, theta, mode, err, steering_deg, speed_percent, min_obstacle_dist_mm)
+    except KeyboardInterrupt:
+        print("  [중단] Ctrl+C로 복귀를 중단했습니다.")
+        publish_speed_command(0.0, float("inf"), goal_reached=False)
+        return False
 
     print("[안내] 복귀 최대 사이클 도달 - 복귀를 완료하지 못했습니다.")
     return False
@@ -992,17 +1070,25 @@ def main():
     def read_scan():
         return read_one_rotation(ser)
 
+    cmd_log = CommandLog(args.out)
     try:
-        map_points, grid, origin, resolution, pose = run_exploration(read_scan, args.max_cycles, live_view=live_view)
+        map_points, grid, origin, resolution, pose, interrupted = run_exploration(
+            read_scan, args.max_cycles, live_view=live_view, cmd_log=cmd_log)
         export_map(args.out, map_points, grid, origin, resolution)
-        print("\n=== 원점으로 복귀 시작 ===")
-        return_to_origin(read_scan, map_points, grid, origin, resolution, pose, args.max_cycles, live_view=live_view)
+        if interrupted:
+            print(f"탐색이 도중에 중단되어 여기까지 만든 맵만 저장했습니다 ({args.out}) - 원점 복귀는 생략합니다.")
+        else:
+            print("\n=== 원점으로 복귀 시작 ===")
+            return_to_origin(read_scan, map_points, grid, origin, resolution, pose, args.max_cycles,
+                              live_view=live_view, cmd_log=cmd_log)
     except KeyboardInterrupt:
         print("\n종료")
     finally:
         close_lidar(ser)
         if live_view is not None:
             live_view.close()
+        cmd_log.close()
+        print(f"명령 기록: {cmd_log.path}")
 
 
 if __name__ == "__main__":

@@ -418,6 +418,39 @@ def test_run_exploration_terminates_and_returns_map(tmp_path, monkeypatch):
         dists = np.full(180, 300.0)  # walls 300mm away on all sides
         return list(zip(angles, dists))
 
-    map_points, grid, origin, resolution, pose = em.run_exploration(fake_scan, max_cycles=5)
+    map_points, grid, origin, resolution, pose, interrupted = em.run_exploration(fake_scan, max_cycles=5)
     assert grid.shape[0] > 0
     assert isinstance(pose, tuple) and len(pose) == 3
+    assert interrupted is False
+
+
+def test_run_exploration_sets_interrupted_flag_on_keyboardinterrupt(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(em, "STATE_DIR", str(state_dir))
+    monkeypatch.setattr(em, "SPEED_STATE_FILE", str(state_dir / "speed_command.json"))
+    monkeypatch.setattr(em, "LIDAR_STEERING_FILE", str(state_dir / "lidar_steering.json"))
+
+    def fake_scan():
+        raise KeyboardInterrupt
+
+    map_points, grid, origin, resolution, pose, interrupted = em.run_exploration(fake_scan, max_cycles=50)
+    assert interrupted is True
+    # whatever was accumulated before the interrupt must still be returned, not lost
+    assert isinstance(pose, tuple) and len(pose) == 3
+
+
+def test_command_log_writes_header_and_rows(tmp_path):
+    log = em.CommandLog(str(tmp_path))
+    log.log("explore", 0, 1.0, 2.0, 3.0, "narrow", 5.0, 4.2, 60.0, 500.0)
+    log.close()
+
+    with open(log.path) as f:
+        lines = f.read().splitlines()
+    assert lines[0].split(",")[:3] == ["timestamp", "phase", "cycle"]
+    assert len(lines) == 2  # header + one row
+    assert "explore" in lines[1]
+
+
+def test_null_command_log_is_noop():
+    em.NULL_COMMAND_LOG.log("explore", 0, 0.0, 0.0, 0.0, "narrow", 1.0, 0.0, 0.0, 100.0)
+    em.NULL_COMMAND_LOG.close()  # must not raise
