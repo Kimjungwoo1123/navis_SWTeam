@@ -399,6 +399,7 @@ def clear_confirmed_free_cells(grid, origin, resolution, robot_xy, scan_world_xy
     h, w = updated.shape
     rx, ry = robot_xy
     for ex, ey in scan_world_xy:
+        end_row, end_col = world_to_grid(ex, ey, origin, resolution)
         dist = np.hypot(ex - rx, ey - ry)
         steps = max(2, int(dist / (resolution / 2)))
         for i in range(steps):  # i=0..steps-1 -> t<1.0, 끝점(장애물 감지 지점) 직전까지만
@@ -406,6 +407,8 @@ def clear_confirmed_free_cells(grid, origin, resolution, robot_xy, scan_world_xy
             x = rx + (ex - rx) * t
             y = ry + (ey - ry) * t
             row, col = world_to_grid(x, y, origin, resolution)
+            if (row, col) == (end_row, end_col):
+                continue  # 격자 해상도상 끝점과 같은 칸으로 양자화되는 경우 - 끝점은 절대 건드리지 않음
             if 0 <= row < h and 0 <= col < w:
                 updated[row, col] = 0
     return updated

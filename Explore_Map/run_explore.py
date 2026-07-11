@@ -67,11 +67,15 @@ def main():
     parser = argparse.ArgumentParser(description="Explore_Map+Steer+Throttle+Ras_output을 한번에 실행하고 감시")
     parser.add_argument("--out", default="./map_output", help="explore_and_map.py 에 넘길 --out (완성된 맵 저장 폴더)")
     parser.add_argument("--max_cycles", type=int, default=None, help="explore_and_map.py 에 넘길 --max_cycles (생략시 기본값 사용)")
+    parser.add_argument("--no_live_view", action="store_true",
+                         help="explore_and_map.py 에 넘길 --no_live_view (디스플레이 없는 헤드리스 환경용)")
     args = parser.parse_args()
 
     explore_args = ["--out", args.out]
     if args.max_cycles is not None:
         explore_args += ["--max_cycles", str(args.max_cycles)]
+    if args.no_live_view:
+        explore_args += ["--no_live_view"]
 
     procs = {
         "explore_and_map": start("explore_and_map", EXPLORE_SCRIPT, explore_args),

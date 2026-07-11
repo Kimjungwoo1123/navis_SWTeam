@@ -939,7 +939,14 @@ def main():
 
     live_view = None
     if not args.no_live_view and matplotlib.get_backend().lower() != "agg":
-        live_view = LiveMapView()
+        # matplotlib.use("TkAgg")는 지연 로딩이라 여기서 실제로 창을 만들어보기 전까지는
+        # 디스플레이가 없어도 실패하지 않는다 - 그래서 진짜 실패 여부는 LiveMapView() 생성
+        # 시점에 try/except로 잡아야 한다 (헤드리스 SSH 환경에서 곧바로 죽는 문제 있었음).
+        try:
+            live_view = LiveMapView()
+        except Exception as e:
+            print(f"[안내] 실시간 시각화 창을 열지 못해({e}) 시각화 없이 진행합니다.")
+            live_view = None
     elif not args.no_live_view:
         print("[안내] 인터랙티브 디스플레이를 찾지 못해 실시간 시각화 없이 진행합니다.")
 
