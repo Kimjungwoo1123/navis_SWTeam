@@ -396,8 +396,8 @@ def test_apply_min_moving_floor_negative_treated_as_stop():
 
 
 def test_apply_min_moving_floor_raises_below_deadzone_value():
-    # CRUISE_SPEED_PERCENT_EXPLORE (~33%) alone is below the real deadzone
-    assert em.apply_min_moving_floor(em.CRUISE_SPEED_PERCENT_EXPLORE) == em.MIN_MOVING_SPEED_PERCENT
+    below_deadzone = em.MIN_MOVING_SPEED_PERCENT - 10.0
+    assert em.apply_min_moving_floor(below_deadzone) == em.MIN_MOVING_SPEED_PERCENT
 
 
 def test_apply_min_moving_floor_leaves_value_above_floor_untouched():
