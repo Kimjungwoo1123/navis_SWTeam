@@ -33,7 +33,16 @@ def load_run(map_dir):
     origin = (meta["origin_x_mm"], meta["origin_y_mm"])
     resolution = meta["resolution_mm"]
     log_path = os.path.join(map_dir, "command_log.csv")
-    log = pd.read_csv(log_path) if os.path.exists(log_path) else None
+    log = None
+    if os.path.exists(log_path):
+        try:
+            log = pd.read_csv(log_path)
+        except pd.errors.EmptyDataError:
+            # 파일은 있는데 헤더 한 줄도 없이 완전히 빈 파일(0바이트) - CommandLog는 생성 즉시
+            # 헤더를 쓰고 flush하므로 정상적으로는 안 생기지만, 프로세스가 그 사이에 죽는 등
+            # 드문 경우 실제로 발생할 수 있다. pandas가 예외를 던지므로 여기서 잡아서
+            # "로그 없음"과 동일하게(None) 취급 - 시각화 자체가 죽으면 안 되므로.
+            log = None
     return grid, origin, resolution, log
 
 
@@ -44,13 +53,21 @@ def plot_run(map_dir, out_path=None):
     out_path = out_path or os.path.join(map_dir, "run_visualization.png")
 
     if log is None or log.empty:
-        reason = "command_log.csv 파일 자체가 없음" if log is None else "command_log.csv에 기록된 사이클이 0개(헤더만 있음)"
+        log_path = os.path.join(map_dir, "command_log.csv")
+        if not os.path.exists(log_path):
+            reason = "command_log.csv 파일 자체가 없음"
+        elif os.path.getsize(log_path) == 0:
+            reason = "command_log.csv가 완전히 빈 파일(0바이트, 헤더도 없음)"
+        else:
+            reason = "command_log.csv에 기록된 사이클이 0개(헤더만 있음)"
+
         fig, ax = plt.subplots(figsize=(8, 8))
         ax.imshow(grid, cmap="gray_r", extent=extent, origin="upper")
         ax.set_title(f"점유 격자 ({reason} - 궤적/조향 표시 불가)")
         fig.savefig(out_path, dpi=150)
+        plt.close(fig)
         print(f"{reason} - 격자만 그렸습니다: {out_path}")
-        if log is not None and log.empty:
+        if os.path.exists(log_path):
             print("  -> 탐색이 사이클을 단 한 번도 완료하지 못했다는 뜻입니다 (예: 라이다 스캔 포인트 부족이 "
                   "계속돼서 '스캔 포인트가 너무 적습니다'만 반복되다 끝난 경우). 실행 당시 콘솔 로그를 확인하세요.")
         return
