@@ -735,13 +735,23 @@ def export_map(out_dir, map_points, grid, origin, resolution):
         "resolution_mm": resolution, "width": export_grid.shape[1], "height": export_grid.shape[0],
     }]).to_csv(os.path.join(out_dir, "map_grid_meta.csv"), index=False)
 
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.imshow(export_grid, cmap="gray_r", origin="upper")
-    ax.set_title("Explore_Map result (unknown -> obstacle)")
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "map_result.png"), dpi=150)
-    plt.close(fig)
-    print(f"  맵 저장 완료: {out_dir} (map_points.csv, map_occupancy_grid.npy, map_grid_meta.csv, map_result.png)")
+    png_saved = False
+    try:
+        # matplotlib.use("TkAgg")는 지연 로딩이라(파일 맨 위 참고) 여기서 실제로 그려보기 전까진
+        # 실패를 알 수 없다 - Path_Planning이 실제로 필요로 하는 건 위 3개 데이터 파일이지 이
+        # png가 아니므로, 그림이 실패해도 이미 저장된 데이터 파일까지 잃으면 안 된다.
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.imshow(export_grid, cmap="gray_r", origin="upper")
+        ax.set_title("Explore_Map result (unknown -> obstacle)")
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "map_result.png"), dpi=150)
+        plt.close(fig)
+        png_saved = True
+    except Exception as e:
+        print(f"  [안내] map_result.png 저장에 실패했습니다({e}) - 맵 데이터 파일은 정상 저장됐습니다.")
+
+    saved = "map_points.csv, map_occupancy_grid.npy, map_grid_meta.csv" + (", map_result.png" if png_saved else "")
+    print(f"  맵 저장 완료: {out_dir} ({saved})")
 
 
 # ----------------------------
