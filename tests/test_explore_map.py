@@ -294,6 +294,37 @@ def test_curvature_speed_factor_uses_explore_max_steering_by_default():
 
 
 # ----------------------------
+# apply_min_moving_floor -- hardware deadzone floor (measured: 50=no motion, 60=motion)
+# ----------------------------
+def test_apply_min_moving_floor_zero_stays_zero():
+    assert em.apply_min_moving_floor(0.0) == 0.0
+
+
+def test_apply_min_moving_floor_negative_treated_as_stop():
+    assert em.apply_min_moving_floor(-5.0) == 0.0
+
+
+def test_apply_min_moving_floor_raises_below_deadzone_value():
+    # CRUISE_SPEED_PERCENT_EXPLORE (~33%) alone is below the real deadzone
+    assert em.apply_min_moving_floor(em.CRUISE_SPEED_PERCENT_EXPLORE) == em.MIN_MOVING_SPEED_PERCENT
+
+
+def test_apply_min_moving_floor_leaves_value_above_floor_untouched():
+    assert em.apply_min_moving_floor(80.0) == 80.0
+
+
+def test_apply_min_moving_floor_clamps_to_full_speed():
+    assert em.apply_min_moving_floor(150.0) == em.FULL_SPEED_PERCENT
+
+
+def test_apply_min_moving_floor_curvature_reduced_speed_never_drops_below_floor():
+    # worst case: cruise speed at its lowest legal value, sharpest curve (min factor)
+    reduced = em.CRUISE_SPEED_PERCENT_EXPLORE * em.CURVE_SPEED_MIN_FACTOR
+    assert reduced < em.MIN_MOVING_SPEED_PERCENT  # sanity: this is exactly the bug scenario
+    assert em.apply_min_moving_floor(reduced) == em.MIN_MOVING_SPEED_PERCENT
+
+
+# ----------------------------
 # ICP / localize_with_recovery
 # ----------------------------
 def _make_wall_cloud(n=400):

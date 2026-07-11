@@ -112,6 +112,23 @@ EXPLORE_SCALE = 1.0 / 3.0
 EXPLORE_MAX_STEERING_DEG = MAX_STEERING_DEG * EXPLORE_SCALE        # 10.0도
 CRUISE_SPEED_PERCENT_EXPLORE = FULL_SPEED_PERCENT * EXPLORE_SCALE  # 약 33.3%
 
+# 실기 캘리브레이션(2026-07-11, cansend로 직접 STM32에 speed만 바꿔가며 실측):
+# speed_percent가 이 미만이면 정지 마찰을 못 이겨서 바퀴가 실제로 안 구른다
+# (50=무반응, 60=반응 확인). 그래서 0(완전정지)이 아닌 이상 실제로 명령을 보낼 땐
+# 항상 이 값 이상으로 올려서 보낸다 - 안 그러면 CRUISE_SPEED_PERCENT_EXPLORE(약 33%)나
+# 곡률 감속(curvature_speed_factor, 최대 0.5배)이 적용된 값이 데드존 밑으로 떨어져서
+# "계산상으론 전진 중"인데 실제로는 제자리에 멈춰있는 상태가 된다 - Explore_Map이
+# 지금까지 안 움직인 것처럼 보였던 것도 이 문제였음. 모터/배터리가 바뀌면 다시 실측 필요.
+MIN_MOVING_SPEED_PERCENT = 60.0
+
+
+def apply_min_moving_floor(speed_percent):
+    """0(정지)이면 그대로 두고, 그 외(전진 의도)엔 MIN_MOVING_SPEED_PERCENT 밑으로 내려가지
+    않게 올려서 반환한다 - 데드존 이하 값을 보내서 모터가 안 움직이는 상태를 방지."""
+    if speed_percent <= 0.0:
+        return 0.0
+    return max(MIN_MOVING_SPEED_PERCENT, min(speed_percent, FULL_SPEED_PERCENT))
+
 # [주의] 이 값은 반드시 (INFLATE_CELLS * GRID_RESOLUTION_MM = 경로가 벽에 붙어서 지나갈 수 있는
 # 최소 거리)보다 작아야 한다. 처음엔 반대로 inflate를 늘려서 맞추려 했는데, 실제 방 크기(3~4m대)
 # 기준으로 inflate를 늘리면 통로 자체가 A*로 못 지나갈 만큼 좁아져 버리는 걸 실측으로 확인했다
@@ -860,7 +877,7 @@ def run_exploration(read_scan_fn, max_cycles=MAX_EXPLORE_CYCLES, live_view=None)
         goal_rc = world_to_grid(goal_xy[0], goal_xy[1], origin, resolution)
         path_rc = astar(inflated, start_rc, goal_rc)
         if path_rc is None:
-            publish_speed_command(base_speed_percent, min_obstacle_dist_mm, goal_reached=False)
+            publish_speed_command(apply_min_moving_floor(base_speed_percent), min_obstacle_dist_mm, goal_reached=False)
             print("  이 프론티어로 가는 경로를 못 찾았습니다. 다음 사이클에 재시도합니다.")
             continue
 
@@ -868,8 +885,10 @@ def run_exploration(read_scan_fn, max_cycles=MAX_EXPLORE_CYCLES, live_view=None)
         steering_deg = pure_pursuit_steering(path_world, x, y, theta, max_steering_deg=EXPLORE_MAX_STEERING_DEG)
         publish_lidar_steering(steering_deg)
 
-        # 회전이 급할수록(조향각이 클수록) 순항 속도를 낮춤 - 비상정지(base_speed_percent=0)는 항상 우선됨
-        speed_percent = base_speed_percent * curvature_speed_factor(steering_deg)
+        # 회전이 급할수록(조향각이 클수록) 순항 속도를 낮춤 - 비상정지(base_speed_percent=0)는 항상 우선됨.
+        # 다만 곡률감속이나 낮은 순항속도 자체가 데드존(MIN_MOVING_SPEED_PERCENT) 밑으로 내려가면 안 되므로
+        # apply_min_moving_floor로 바닥을 깐다 (정지 의도인 0.0은 그대로 통과시킴).
+        speed_percent = apply_min_moving_floor(base_speed_percent * curvature_speed_factor(steering_deg))
         publish_speed_command(speed_percent, min_obstacle_dist_mm, goal_reached=False)
     else:
         print(f"[안내] 최대 사이클({max_cycles}) 도달 - 탐색을 중단합니다.")
@@ -930,7 +949,7 @@ def return_to_origin(read_scan_fn, map_points, grid, origin, resolution, pose, m
         goal_rc = world_to_grid(0.0, 0.0, origin, resolution)
         path_rc = astar(inflated, start_rc, goal_rc)
         if path_rc is None:
-            publish_speed_command(base_speed_percent, min_obstacle_dist_mm, goal_reached=False)
+            publish_speed_command(apply_min_moving_floor(base_speed_percent), min_obstacle_dist_mm, goal_reached=False)
             print("  복귀 경로를 못 찾았습니다. 다음 스캔에서 재시도합니다.")
             continue
 
@@ -938,7 +957,7 @@ def return_to_origin(read_scan_fn, map_points, grid, origin, resolution, pose, m
         steering_deg = pure_pursuit_steering(path_world, x, y, theta, max_steering_deg=EXPLORE_MAX_STEERING_DEG)
         publish_lidar_steering(steering_deg)
 
-        speed_percent = base_speed_percent * curvature_speed_factor(steering_deg)
+        speed_percent = apply_min_moving_floor(base_speed_percent * curvature_speed_factor(steering_deg))
         publish_speed_command(speed_percent, min_obstacle_dist_mm, goal_reached=False)
 
     print("[안내] 복귀 최대 사이클 도달 - 복귀를 완료하지 못했습니다.")
