@@ -1,0 +1,5 @@
+../Core/Src/actuator.c:16:6:Motor_Init	1
+../Core/Src/actuator.c:24:6:Servo_Init	1
+../Core/Src/actuator.c:29:6:Motor_SetSpeed	6
+../Core/Src/actuator.c:57:6:Servo_SetAngle	3
+../Core/Src/actuator.c:68:6:Servo_Release	1

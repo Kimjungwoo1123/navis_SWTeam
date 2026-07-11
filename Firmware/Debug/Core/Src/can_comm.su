@@ -1,0 +1,3 @@
+../Core/Src/can_comm.c:10:6:CAN_Comm_Init	48	static
+../Core/Src/can_comm.c:36:6:CAN_Comm_Poll	48	static
+../Core/Src/can_comm.c:58:6:CAN_Comm_SendStatus	56	static
