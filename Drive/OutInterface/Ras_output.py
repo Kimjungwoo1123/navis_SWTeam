@@ -148,6 +148,21 @@ class Stm32Link:
         self._recv_thread = threading.Thread(target=self._receive_loop, daemon=True)
         self._recv_thread.start()
 
+    def wait_for_first_status(self, timeout=1.0):
+        """STM32의 첫 0x200을 받을 때까지(최대 timeout초) 대기.
+        STM32는 100ms마다만 0x200을 보내는데 메인 제어루프는 시작하자마자 50Hz로 바로
+        워치독을 체크하기 시작하면, 그 사이 짧은 순간엔 '아직 못 받았을 뿐'인데도 check_watchdog()가
+        매번 정직하게 '통신 두절 의심'을 찍고 바로 복귀하는 게 매 실행마다 반복돼서 혼란을 줬다.
+        루프 시작 전에 여기서 한 번 기다려주면 그 콜드스타트 메시지 자체가 안 뜨게 된다.
+        반환: 제한시간 안에 받았으면 True, 못 받았으면(배선/전원 문제 등) False."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._status_lock:
+                if self._last_status_time is not None:
+                    return True
+            time.sleep(0.02)
+        return False
+
     def _receive_loop(self):
         """0x200(STATUS)을 계속 수신해서 최신 실측값을 저장 - send_drive()와 별도 스레드라
         50Hz 송신 루프를 블로킹하지 않음."""
@@ -214,6 +229,13 @@ class Stm32Link:
 def main():
     print("STM32 출력(Ras_output) 시작 - CAN 채널 can0 (Ctrl+C 종료)")
     link = Stm32Link(channel="can0")
+
+    if link.wait_for_first_status(timeout=STATUS_RECV_TIMEOUT_S):
+        print("STM32 상태(0x200) 수신 확인 - 제어 루프 시작")
+    else:
+        print(f"[경고] {STATUS_RECV_TIMEOUT_S:.0f}초 동안 STM32 상태(0x200)를 못 받았습니다 - "
+              f"CAN 배선/STM32 전원을 확인하세요. 일단 제어 루프는 시작합니다.")
+
     was_ok = True   # reason 문자열엔 실측값이 섞여 매 사이클 바뀔 수 있어, ok/not ok "전환" 기준으로만 출력
     was_estopped = False
     try:

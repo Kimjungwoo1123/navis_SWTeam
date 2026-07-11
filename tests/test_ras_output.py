@@ -127,6 +127,21 @@ def test_watchdog_no_status_ever_received_is_not_ok():
     assert "응답" in reason or "통신" in reason
 
 
+# ----------------------------
+# wait_for_first_status -- avoids the "통신 두절 의심" cold-start message on every startup
+# ----------------------------
+def test_wait_for_first_status_returns_true_once_status_arrives():
+    link = _make_link()
+    link._last_status = (0, ro.ANGLE_CENTER)
+    link._last_status_time = time.time()  # simulate the receive thread already having a status
+    assert link.wait_for_first_status(timeout=0.5) is True
+
+
+def test_wait_for_first_status_times_out_when_nothing_arrives():
+    link = _make_link()
+    assert link.wait_for_first_status(timeout=0.1) is False
+
+
 def test_watchdog_status_timed_out_is_not_ok():
     link = _make_link(last_speed=50, last_angle=90)
     link._last_status = (50, 90)
