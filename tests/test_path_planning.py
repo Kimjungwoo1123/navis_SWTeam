@@ -341,6 +341,52 @@ def test_parse_ld06_packet_bad_header_rejected():
     assert pp.parse_ld06_packet(bytes(packet)) is None
 
 
+class _FakeSerial:
+    """buffer 안의 바이트를 read(n)으로 조금씩 흘려주는 가짜 시리얼 포트."""
+
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+
+    def read(self, n):
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += len(chunk)
+        return chunk
+
+
+def test_sync_to_ld06_header_finds_header_after_garbage_prefix():
+    packet = _build_ld06_packet(0.0, 30.0, [500] * 12)
+    stream = b"\x01\x02\x03garbage" + packet
+    ser = _FakeSerial(stream)
+    assert pp.sync_to_ld06_header(ser) is True
+    # after syncing, the two header bytes must already be consumed
+    rest = ser.read(45)
+    assert len(rest) == 45
+    assert bytes([0x54, 0x2C]) + rest == packet
+
+
+def test_sync_to_ld06_header_returns_false_on_empty_stream():
+    ser = _FakeSerial(b"")
+    assert pp.sync_to_ld06_header(ser) is False
+
+
+def test_read_one_rotation_recovers_when_stream_starts_mid_packet():
+    # exactly the failure mode observed on real hardware: the port is opened mid-stream,
+    # so the very first bytes are the tail of some earlier packet, not a header. Without
+    # header resync, read(47) stays permanently misaligned since packets are also 47 bytes.
+    starts = list(range(0, 360, 30))  # one full rotation, then wrap back to 0 to trigger the break
+    rotation_packets = b"".join(_build_ld06_packet(float(s), float(s + 30), [500] * 12) for s in starts)
+    one_extra_wrap_packet = _build_ld06_packet(0.0, 30.0, [500] * 12)
+    full_stream = rotation_packets + one_extra_wrap_packet
+
+    misaligned_prefix = full_stream[20:47]  # tail of a "previous" packet, no header at position 0
+    stream = misaligned_prefix + full_stream
+    ser = _FakeSerial(stream)
+
+    points = pp.read_one_rotation(ser, min_points=60, max_wait_s=3.0)
+    assert len(points) >= 60
+
+
 # ----------------------------
 # publish_speed_command / publish_lidar_steering (file I/O)
 # ----------------------------

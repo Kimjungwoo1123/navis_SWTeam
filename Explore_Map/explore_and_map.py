@@ -185,6 +185,23 @@ def close_lidar(ser):
     ser.close()
 
 
+def sync_to_ld06_header(ser):
+    """스트림에서 0x54,0x2C 헤더 두 바이트가 연속으로 나오는 지점까지 한 바이트씩 읽어서 맞춘다.
+    시리얼 포트를 열었을 때 라이다는 이미 계속 스캔 중이라 스트림 중간부터 읽기 시작하게 되는데,
+    패킷 크기(47바이트)와 read(47) 크기가 같아서 한 번 어긋나면 그 오프셋이 영원히 고정돼버려
+    (자연 정렬될 기회가 없음) parse_ld06_packet이 매번 헤더 불일치로 실패하는 문제가 있었다.
+    반환: 헤더를 찾으면 True, 타임아웃(라이다 연결 끊김 등)으로 못 찾으면 False"""
+    prev = None
+    while True:
+        b = ser.read(1)
+        if len(b) != 1:
+            return False
+        cur = b[0]
+        if prev == 0x54 and cur == 0x2C:
+            return True
+        prev = cur
+
+
 def read_one_rotation(ser, min_points=60, max_wait_s=3.0):
     """대략 한 바퀴(360도) 분량의 (angle_deg, distance_mm) 점을 모아서 반환."""
     points = []
@@ -193,9 +210,12 @@ def read_one_rotation(ser, min_points=60, max_wait_s=3.0):
     while True:
         if time.time() - t0 > max_wait_s:
             break
-        raw = ser.read(47)
-        if len(raw) != 47:
+        if not sync_to_ld06_header(ser):
             continue
+        rest = ser.read(45)
+        if len(rest) != 45:
+            continue
+        raw = bytes([0x54, 0x2C]) + rest
         result = parse_ld06_packet(raw)
         if result is None:
             continue

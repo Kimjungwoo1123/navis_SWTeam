@@ -1,9 +1,54 @@
 import json
+import struct
 
 import numpy as np
 import pytest
 
 import explore_and_map as em
+
+
+class _FakeSerial:
+    """buffer 안의 바이트를 read(n)으로 조금씩 흘려주는 가짜 시리얼 포트."""
+
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+
+    def read(self, n):
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += len(chunk)
+        return chunk
+
+
+def _build_ld06_packet(start_angle_deg, end_angle_deg, distances):
+    header = bytes([0x54, 0x2C])
+    speed = struct.pack('<H', 3000)
+    start = struct.pack('<H', int(start_angle_deg * 100))
+    body = b"".join(struct.pack('<H', d) + bytes([200]) for d in distances)
+    end = struct.pack('<H', int(end_angle_deg * 100))
+    timestamp = struct.pack('<H', 0)
+    crc = bytes([0])
+    return header + speed + start + body + end + timestamp + crc
+
+
+def test_sync_to_ld06_header_finds_header_after_garbage_prefix():
+    packet = _build_ld06_packet(0.0, 30.0, [500] * 12)
+    ser = _FakeSerial(b"\x01\x02\x03garbage" + packet)
+    assert em.sync_to_ld06_header(ser) is True
+    rest = ser.read(45)
+    assert bytes([0x54, 0x2C]) + rest == packet
+
+
+def test_read_one_rotation_recovers_when_stream_starts_mid_packet():
+    starts = list(range(0, 360, 30))
+    rotation_packets = b"".join(_build_ld06_packet(float(s), float(s + 30), [500] * 12) for s in starts)
+    one_extra_wrap_packet = _build_ld06_packet(0.0, 30.0, [500] * 12)
+    full_stream = rotation_packets + one_extra_wrap_packet
+    misaligned_prefix = full_stream[20:47]
+    ser = _FakeSerial(misaligned_prefix + full_stream)
+
+    points = em.read_one_rotation(ser, min_points=60, max_wait_s=3.0)
+    assert len(points) >= 60
 
 
 # ----------------------------
