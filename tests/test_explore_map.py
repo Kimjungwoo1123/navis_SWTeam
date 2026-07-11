@@ -1,5 +1,6 @@
 import json
 import struct
+import time
 
 import numpy as np
 import pytest
@@ -259,6 +260,96 @@ def test_choose_frontier_goal_reaches_open_frontier():
     assert goal is not None
 
 
+def test_choose_frontier_goal_skips_avoided_point():
+    # a single small explored room -> exactly one frontier cluster/goal candidate
+    grid = np.full((20, 20), -1, dtype=np.int8)
+    grid[8:12, 8:12] = 0
+    origin = (-500.0, -500.0)
+    resolution = 50.0
+    inflated = em.build_planning_grid(grid)
+    robot_xy = em.grid_to_world(10, 10, origin, resolution)
+
+    goal, reason = em.choose_frontier_goal(grid, robot_xy, origin, resolution, inflated)
+    assert goal is not None
+
+    # avoiding that exact goal (large radius) should leave no viable candidate
+    goal2, reason2 = em.choose_frontier_goal(grid, robot_xy, origin, resolution, inflated,
+                                              avoid_points=[goal], avoid_radius_mm=1000.0)
+    assert goal2 is None
+    assert reason2 == "unreachable"
+
+
+# ----------------------------
+# StallDetector - lidar-blind low obstacle detection
+# ----------------------------
+def test_stall_detector_not_stalled_before_window_elapses():
+    stall = em.StallDetector(window_s=2.0, min_displacement_mm=50.0)
+    stall.update(0.0, 0.0, 0.0)
+    stall.update(0.5, 0.0, 0.0)
+    assert stall.is_stalled(0.5) is False  # window hasn't elapsed yet
+
+
+def test_stall_detector_true_when_no_displacement_over_window():
+    stall = em.StallDetector(window_s=2.0, min_displacement_mm=50.0)
+    stall.update(0.0, 0.0, 0.0)
+    stall.update(1.0, 3.0, -2.0)   # tiny jitter, well under threshold
+    stall.update(2.1, 4.0, 1.0)
+    assert stall.is_stalled(2.1) is True
+
+
+def test_stall_detector_false_when_actually_moving():
+    stall = em.StallDetector(window_s=2.0, min_displacement_mm=50.0)
+    stall.update(0.0, 0.0, 0.0)
+    stall.update(1.0, 100.0, 0.0)
+    stall.update(2.1, 300.0, 0.0)
+    assert stall.is_stalled(2.1) is False
+
+
+def test_stall_detector_reset_clears_history():
+    stall = em.StallDetector(window_s=2.0, min_displacement_mm=50.0)
+    stall.update(0.0, 0.0, 0.0)
+    stall.update(2.1, 1.0, 1.0)
+    assert stall.is_stalled(2.1) is True
+    stall.reset()
+    assert stall.is_stalled(2.1) is False  # no history at all now
+
+
+def test_run_exploration_reverses_when_stalled(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(em, "STATE_DIR", str(state_dir))
+    monkeypatch.setattr(em, "SPEED_STATE_FILE", str(state_dir / "speed_command.json"))
+    monkeypatch.setattr(em, "LIDAR_STEERING_FILE", str(state_dir / "lidar_steering.json"))
+    # StallDetector's default args are bound at class-definition time, so monkeypatching
+    # STALL_CHECK_WINDOW_S here wouldn't affect it - inject a fast instance instead (below).
+    monkeypatch.setattr(em, "STALL_REVERSE_DURATION_S", 0.01)
+
+    # force localize_with_recovery to always report the exact same position (never moves),
+    # like a car whose wheels are spinning against an obstacle the lidar can't see
+    def fake_localize_with_recovery(current_scan, map_icp_target, prev_pose, consecutive_lost):
+        return 0.0, 0.0, 0.0, 1.0, "narrow", 0, True
+
+    monkeypatch.setattr(em, "localize_with_recovery", fake_localize_with_recovery)
+
+    def fake_scan():
+        time.sleep(0.03)  # advance real wall-clock time so STALL_CHECK_WINDOW_S actually elapses
+        angles = np.linspace(0, 359, 180)
+        # only the front half returns a real hit; the back half reads beyond MAX_RANGE_MM so
+        # polar_to_xy() filters it out entirely, leaving that half permanently UNKNOWN -> a
+        # frontier that never goes away as long as the (mocked) pose never actually moves,
+        # unlike a full-circle scan which "finishes" exploring in a single cycle
+        dists = np.where(angles < 180, 700.0, 9000.0)
+        return list(zip(angles, dists))
+
+    log = em.CommandLog(str(tmp_path / "map_output"))
+    fast_stall = em.StallDetector(window_s=0.05, min_displacement_mm=50.0)
+    result = em.run_exploration(fake_scan, max_cycles=10, cmd_log=log, stall=fast_stall)
+    log.close()
+
+    with open(log.path) as f:
+        contents = f.read()
+    assert "stall_reverse" in contents
+
+
 # ----------------------------
 # astar (own copy, includes bounds + blocked start/goal checks)
 # ----------------------------
@@ -394,10 +485,12 @@ def test_export_map_writes_expected_files(tmp_path):
     out_dir = tmp_path / "map_output"
     em.export_map(str(out_dir), np.array([[0.0, 0.0], [10.0, 10.0]]), grid, (-100.0, -100.0), 50.0)
 
+    # the data files are the ones Path_Planning actually consumes and must always exist;
+    # map_result.png is best-effort (export_map() deliberately tolerates a broken/missing
+    # plotting backend rather than losing the data - see explore_and_map.py export_map())
     assert (out_dir / "map_points.csv").exists()
     assert (out_dir / "map_occupancy_grid.npy").exists()
     assert (out_dir / "map_grid_meta.csv").exists()
-    assert (out_dir / "map_result.png").exists()
 
     exported_grid = np.load(out_dir / "map_occupancy_grid.npy")
     assert exported_grid[2, 2] == 1  # confirmed obstacle preserved

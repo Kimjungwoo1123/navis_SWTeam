@@ -130,6 +130,50 @@ def apply_min_moving_floor(speed_percent):
         return 0.0
     return max(MIN_MOVING_SPEED_PERCENT, min(speed_percent, FULL_SPEED_PERCENT))
 
+
+# ----------------------------
+# 정체(stall) 감지 + 후진 탈출
+# 실기 로그에서 실제로 재현된 문제: 라이다 스캔 평면보다 낮은 바닥 장애물(문턱, 케이블 등)에
+# 걸리면 lidar는 계속 "앞이 비어있다"고 보고해서 계속 전진 명령을 내리는데, 바퀴는 그 자리에서
+# 헛돌기만 하고 차는 전혀 못 움직인다 - 장애물 회피(min_obstacle_dist_mm)로는 절대 못 잡아내는
+# 사각지대. 그래서 "명령은 계속 나가는데 실제 위치가 안 바뀐다"는 것 자체를 별도로 감시한다.
+# ----------------------------
+STALL_CHECK_WINDOW_S = 2.0        # 이 시간 동안의 이동량을 본다
+STALL_DISPLACEMENT_MM = 50.0      # 이 시간 동안 이 거리도 못 움직였으면 "막혔다"고 판단
+STALL_REVERSE_SPEED_PERCENT = -MIN_MOVING_SPEED_PERCENT  # 후진도 같은 데드존이 있다고 가정
+# (전진 기준으로만 실측함 - 후진 데드존이 다르면 재조정 필요)
+STALL_REVERSE_DURATION_S = 1.2    # 후진을 몇 초간 유지할지
+STALL_AVOID_RADIUS_MM = 400.0     # 막혔던 지점 주변은 이후 프론티어 후보에서 계속 제외
+
+
+class StallDetector:
+    """직진/회전 명령을 계속 내는데도 실제 위치가 STALL_CHECK_WINDOW_S 동안
+    STALL_DISPLACEMENT_MM 이상 못 움직이면 '막혔다'고 판단하는 헬퍼."""
+
+    def __init__(self, window_s=STALL_CHECK_WINDOW_S, min_displacement_mm=STALL_DISPLACEMENT_MM):
+        self.window_s = window_s
+        self.min_displacement_mm = min_displacement_mm
+        self.history = []  # [(t, x, y), ...] 오래된 것부터
+
+    def reset(self):
+        self.history.clear()
+
+    def update(self, t, x, y):
+        self.history.append((t, x, y))
+        # window_s보다 오래된 기준점은 하나만 남기고 정리 (그게 비교 기준이 됨)
+        while len(self.history) >= 2 and (t - self.history[1][0]) >= self.window_s:
+            self.history.pop(0)
+
+    def is_stalled(self, t):
+        if not self.history:
+            return False
+        t0, x0, y0 = self.history[0]
+        if (t - t0) < self.window_s:
+            return False  # 아직 window_s만큼 지켜보지 못함 (막 시작했거나 막 리셋됨)
+        _, x1, y1 = self.history[-1]
+        return bool(np.hypot(x1 - x0, y1 - y0) < self.min_displacement_mm)
+
+
 # [주의] 이 값은 반드시 (INFLATE_CELLS * GRID_RESOLUTION_MM = 경로가 벽에 붙어서 지나갈 수 있는
 # 최소 거리)보다 작아야 한다. 처음엔 반대로 inflate를 늘려서 맞추려 했는데, 실제 방 크기(3~4m대)
 # 기준으로 inflate를 늘리면 통로 자체가 A*로 못 지나갈 만큼 좁아져 버리는 걸 실측으로 확인했다
@@ -594,10 +638,15 @@ def find_nearby_passable_cell(inflated_obstacle_grid, row, col, max_radius=4):
     return None
 
 
-def choose_frontier_goal(grid, robot_xy, origin, resolution, inflated_obstacle_grid):
+def choose_frontier_goal(grid, robot_xy, origin, resolution, inflated_obstacle_grid,
+                          avoid_points=None, avoid_radius_mm=0.0):
     """
     반환: (goal_xy 또는 None, reason)
     reason: "ok" | "no_frontier"(더 갈 미지영역 없음=탐색완료) | "unreachable"(후보는 있는데 다 막힘)
+
+    avoid_points: [(x_mm, y_mm), ...] - 이 지점들 근방(avoid_radius_mm 이내)의 프론티어는 후보에서
+    제외한다. 라이다가 못 보는 낮은 장애물에 걸려 정지(stall)했던 지점을 다시 목표로 잡지 않기
+    위함 - 지도상으로는 여전히 "갈 수 있는 것처럼" 보이므로 A*만으로는 걸러지지 않는다.
     """
     frontier_mask = find_frontier_mask(grid)
     clusters = cluster_frontiers(frontier_mask)
@@ -614,6 +663,9 @@ def choose_frontier_goal(grid, robot_xy, origin, resolution, inflated_obstacle_g
     start_rc = world_to_grid(rx, ry, origin, resolution)
 
     for row, col in clusters:
+        wx, wy = grid_to_world(row, col, origin, resolution)
+        if avoid_points and any(np.hypot(wx - ax, wy - ay) <= avoid_radius_mm for ax, ay in avoid_points):
+            continue
         goal_cell = find_nearby_passable_cell(inflated_obstacle_grid, row, col)
         if goal_cell is None:
             continue
@@ -853,10 +905,14 @@ NULL_COMMAND_LOG = _NullCommandLog()
 # ----------------------------
 # 탐색 루프
 # ----------------------------
-def run_exploration(read_scan_fn, max_cycles=MAX_EXPLORE_CYCLES, live_view=None, cmd_log=NULL_COMMAND_LOG):
+def run_exploration(read_scan_fn, max_cycles=MAX_EXPLORE_CYCLES, live_view=None, cmd_log=NULL_COMMAND_LOG,
+                     stall=None):
     """
     read_scan_fn(): 다음 스캔의 [(angle_deg, distance_mm), ...] 를 반환하는 함수.
     실제 하드웨어에서는 read_one_rotation(ser)를 감싼 함수, 테스트에서는 가상 스캔 생성 함수를 넣음.
+    stall: StallDetector 주입용 (생략하면 기본 설정으로 새로 만듦) - 테스트에서 window_s를 짧게
+    줄여서 검증할 때 씀. StallDetector.__init__의 기본 인자는 모듈 임포트 시점에 한 번만 바인딩돼서
+    이후 STALL_CHECK_WINDOW_S를 monkeypatch해도 반영이 안 되므로, 주입 방식으로 우회한다.
     반환: (map_points, grid, origin, resolution, final_pose, interrupted)
     interrupted=True면 Ctrl+C로 도중에 중단된 것 - 그때까지 쌓은 데이터는 정상적으로 반환하므로
     호출부(main())는 이 경우에도 export_map()으로 저장할 수 있다.
@@ -867,6 +923,8 @@ def run_exploration(read_scan_fn, max_cycles=MAX_EXPLORE_CYCLES, live_view=None,
     min_obstacle_dist_mm = float("inf")
     consecutive_lost = 0
     interrupted = False
+    stall = stall if stall is not None else StallDetector()
+    avoid_points = []  # 후진으로 탈출했던 지점들 - 프론티어 후보에서 계속 제외
 
     try:
         for cycle in range(max_cycles):
@@ -903,6 +961,7 @@ def run_exploration(read_scan_fn, max_cycles=MAX_EXPLORE_CYCLES, live_view=None,
 
             pose = (x, y, theta)
             print(f"[cycle {cycle}] 위치({mode}): x={x:.0f}mm y={y:.0f}mm theta={theta:.1f}deg err={err:.1f}mm")
+            stall.update(time.time(), x, y)
 
             scan_world = transform_points(current_scan, x, y, theta)
             map_points = np.vstack([map_points, scan_world]) if len(map_points) else scan_world
@@ -921,8 +980,28 @@ def run_exploration(read_scan_fn, max_cycles=MAX_EXPLORE_CYCLES, live_view=None,
                 print("  전/후/좌/우 모두 확인된 장애물로 막혀 더 이상 움직일 수 없습니다 - 탐색을 종료합니다.")
                 break
 
+            # 정체(stall) 감지: 라이다 스캔 평면보다 낮아서 안 보이는 바닥 장애물(문턱, 케이블 등)에
+            # 걸리면 min_obstacle_dist_mm은 계속 멀쩡하게 나와서 위 장애물 감지로는 못 잡는다 -
+            # "명령은 계속 나가는데 실제 위치가 안 바뀐다"는 것 자체를 감시해서 걸러낸다.
+            if base_speed_percent > 0.0 and stall.is_stalled(time.time()):
+                print(f"  [정체 감지] 최근 {STALL_CHECK_WINDOW_S:.0f}초 동안 {STALL_DISPLACEMENT_MM:.0f}mm도 "
+                      f"못 움직였습니다 - 라이다가 못 보는 장애물에 걸린 것으로 보고 후진합니다.")
+                publish_lidar_steering(0.0)
+                publish_speed_command(STALL_REVERSE_SPEED_PERCENT, min_obstacle_dist_mm, goal_reached=False)
+                cmd_log.log("explore", cycle, x, y, theta, mode, err, 0.0, STALL_REVERSE_SPEED_PERCENT,
+                             min_obstacle_dist_mm, note="stall_reverse")
+                if live_view is not None:
+                    live_view.update(grid, origin, resolution, pose, goal_xy=None,
+                                      title=f"탐색 cycle {cycle} - 정체 감지, 후진 중")
+                time.sleep(STALL_REVERSE_DURATION_S)
+                publish_speed_command(0.0, min_obstacle_dist_mm, goal_reached=False)
+                avoid_points.append((x, y))
+                stall.reset()
+                continue
+
             inflated = build_planning_grid(grid, INFLATE_CELLS)
-            goal_xy, reason = choose_frontier_goal(grid, (x, y), origin, resolution, inflated)
+            goal_xy, reason = choose_frontier_goal(grid, (x, y), origin, resolution, inflated,
+                                                    avoid_points=avoid_points, avoid_radius_mm=STALL_AVOID_RADIUS_MM)
 
             if live_view is not None:
                 live_view.update(grid, origin, resolution, pose, goal_xy=goal_xy, title=f"탐색 중 - cycle {cycle}")
