@@ -44,11 +44,15 @@ def plot_run(map_dir, out_path=None):
     out_path = out_path or os.path.join(map_dir, "run_visualization.png")
 
     if log is None or log.empty:
+        reason = "command_log.csv 파일 자체가 없음" if log is None else "command_log.csv에 기록된 사이클이 0개(헤더만 있음)"
         fig, ax = plt.subplots(figsize=(8, 8))
         ax.imshow(grid, cmap="gray_r", extent=extent, origin="upper")
-        ax.set_title("점유 격자 (command_log.csv 없음 - 궤적/조향 표시 불가)")
+        ax.set_title(f"점유 격자 ({reason} - 궤적/조향 표시 불가)")
         fig.savefig(out_path, dpi=150)
-        print(f"command_log.csv가 없어서 격자만 그렸습니다: {out_path}")
+        print(f"{reason} - 격자만 그렸습니다: {out_path}")
+        if log is not None and log.empty:
+            print("  -> 탐색이 사이클을 단 한 번도 완료하지 못했다는 뜻입니다 (예: 라이다 스캔 포인트 부족이 "
+                  "계속돼서 '스캔 포인트가 너무 적습니다'만 반복되다 끝난 경우). 실행 당시 콘솔 로그를 확인하세요.")
         return
 
     fig = plt.figure(figsize=(14, 8))
